@@ -2,6 +2,7 @@ import Testing
 import Foundation
 import Combine
 import CoreBluetooth
+import BitFoundation
 @testable import bitchat
 
 private final class DefaultDelegateProbe: BitchatDelegate {
@@ -14,17 +15,13 @@ private final class DefaultDelegateProbe: BitchatDelegate {
 
 private final class DefaultTransportProbe: Transport {
     weak var delegate: BitchatDelegate?
+    weak var eventDelegate: TransportEventDelegate?
     weak var peerEventsDelegate: TransportPeerEventsDelegate?
 
     let subject = CurrentValueSubject<[TransportPeerSnapshot], Never>([])
     let myPeerID = PeerID(str: "0011223344556677")
     var myNickname = "Tester"
-    private let keychain = MockKeychain()
     private(set) var sentMessages: [(content: String, mentions: [String])] = []
-
-    var peerSnapshotPublisher: AnyPublisher<[TransportPeerSnapshot], Never> {
-        subject.eraseToAnyPublisher()
-    }
 
     func currentPeerSnapshots() -> [TransportPeerSnapshot] { subject.value }
     func setNickname(_ nickname: String) { myNickname = nickname }
@@ -38,7 +35,6 @@ private final class DefaultTransportProbe: Transport {
     func getFingerprint(for peerID: PeerID) -> String? { nil }
     func getNoiseSessionState(for peerID: PeerID) -> LazyHandshakeState { .none }
     func triggerHandshake(with peerID: PeerID) {}
-    func getNoiseService() -> NoiseEncryptionService { NoiseEncryptionService(keychain: keychain) }
     func sendMessage(_ content: String, mentions: [String]) { sentMessages.append((content, mentions)) }
     func sendPrivateMessage(_ content: String, to peerID: PeerID, recipientNickname: String, messageID: String) {}
     func sendReadReceipt(_ receipt: ReadReceipt, to peerID: PeerID) {}
@@ -50,14 +46,19 @@ private final class DefaultTransportProbe: Transport {
 struct ProtocolContractTests {
     @Test
     func commandInfo_exposesAliasesPlaceholdersAndGeoVariants() {
-        #expect(CommandInfo.message.id == "dm")
-        #expect(CommandInfo.message.alias == "/dm")
+        // Aliases must match what CommandProcessor actually accepts —
+        // the suggestion panel is the only command-discovery surface.
+        #expect(CommandInfo.message.id == "msg")
+        #expect(CommandInfo.message.alias == "/msg")
         #expect(CommandInfo.message.placeholder != nil)
         #expect(CommandInfo.clear.placeholder == nil)
         #expect(CommandInfo.favorite.description.isEmpty == false)
-        #expect(CommandInfo.all(isGeoPublic: false, isGeoDM: false).contains(.favorite) == false)
-        #expect(CommandInfo.all(isGeoPublic: true, isGeoDM: false).contains(.favorite))
-        #expect(CommandInfo.all(isGeoPublic: false, isGeoDM: true).contains(.unfavorite))
+        #expect(CommandInfo.all(isGeoPublic: false, isGeoDM: false).contains(.help))
+        // Favorites are rejected by the processor in geohash contexts, so
+        // they are suggested only in mesh.
+        #expect(CommandInfo.all(isGeoPublic: false, isGeoDM: false).contains(.favorite))
+        #expect(CommandInfo.all(isGeoPublic: true, isGeoDM: false).contains(.favorite) == false)
+        #expect(CommandInfo.all(isGeoPublic: false, isGeoDM: true).contains(.unfavorite) == false)
     }
 
     @Test
@@ -84,24 +85,19 @@ struct ProtocolContractTests {
     func transportDefaults_forwardOrNoOp() {
         let probe = DefaultTransportProbe()
         let peerID = PeerID(str: "0123456789abcdef")
-        let filePacket = BitchatFilePacket(
-            fileName: "voice.m4a",
-            fileSize: 4,
-            mimeType: "audio/mp4",
-            content: Data([1, 2, 3, 4])
-        )
 
         probe.sendMessage("hello", mentions: ["@alice"], messageID: "msg-1", timestamp: Date())
-        probe.sendVerifyChallenge(to: peerID, noiseKeyHex: "abcd", nonceA: Data([0x01]))
-        probe.sendVerifyResponse(to: peerID, noiseKeyHex: "abcd", nonceA: Data([0x02]))
-        probe.sendFileBroadcast(filePacket, transferId: "tx-1")
-        probe.sendFilePrivate(filePacket, to: peerID, transferId: "tx-2")
-        probe.cancelTransfer("tx-3")
-        probe.declinePendingFile(id: "pending")
 
         #expect(probe.sentMessages.count == 1)
         #expect(probe.sentMessages.first?.content == "hello")
-        #expect(probe.acceptPendingFile(id: "pending") == nil)
+        // Mesh-only features are capability protocols now, not inert
+        // defaults: a core-only transport simply doesn't have them.
+        #expect(!(probe as AnyObject is MeshFileTransferring))
+        #expect(!(probe as AnyObject is MeshDiagnosing))
+        #expect(probe.peerCapabilities(peerID).isEmpty)
+        // Secure delivery defaults to prompt delivery (itself defaulting to
+        // reachability) for transports without a forgeable link layer.
+        #expect(probe.canDeliverSecurely(to: peerID) == false)
     }
 
     @Test
